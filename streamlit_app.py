@@ -39,7 +39,8 @@ embedding_method = OpenAIEmbeddings()
 st.session_state["source_path"] = "./policy_documents"
 st.session_state["input_format"] = "txt"
 if "llm" not in st.session_state:
-    st.session_state['llm'] = ChatOpenAI(model="gpt-3.5-turbo-0125") #ChatVertexAI(model="gemini-1.5-pro-001")
+    # st.session_state['llm'] = ChatOpenAI(model="gpt-3.5-turbo-0125") #ChatVertexAI(model="gemini-1.5-pro-001")
+    st.session_state['llm'] = ChatOpenAI(model="gpt-4-0613")
 if "store" not in st.session_state:
     st.session_state['store'] = {}
 
