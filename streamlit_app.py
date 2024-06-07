@@ -1,7 +1,6 @@
 ## -------------------- Import dependencies -------------------- ##
 
 import os
-from PyPDF2 import PdfReader
 import streamlit as st
 
 from langchain_community.document_loaders import WebBaseLoader
