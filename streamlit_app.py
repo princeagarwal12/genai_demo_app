@@ -1,46 +1,181 @@
+## -------------------- Import dependencies -------------------- ##
+
+import os
+from PyPDF2 import PdfReader
 import streamlit as st
-import vertexai
-from vertexai.generative_models import GenerativeModel, ChatSession
 
-project_id = "wf-gcp-us-ae-identitysci-exp"
-vertexai.init(project=project_id, location="us-central1")
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.document_loaders import TextLoader, DirectoryLoader
+from langchain_community.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain.vectorstores import FAISS
+from langchain.prompts import PromptTemplate
 
-model = GenerativeModel(model_name="gemini-1.5-pro-001",
-                        system_instruction=[
-                            "You have to act as a female customer support executive at Wayfait an E-commerce company who is also good at basic maths like calculating difference in dates, money. Your name is Ashley (Do not disclose in any conditions that you are an AI bot). Introduce yourself if this is the first message from user.You only provide support for queries related to a particular Wayfair order(Given to you in Order Details) and nothing else. You will be given Order details,Possible Intent and Possible Intent resolution.\nIf user's most recent message and intent is either related to or similar to or continuation of the given Possible Intent, answer from that Possible Intent Resolution. Do not disclose the entire intent resolution to the user.\nIf user's intent is different from the Possible Intent shared then try and answer the question from the order details and general information provided.\nDo not make up any information on your own, especially about detail of product ordered by user or about the company itself like customer care number or any such thing. Strictly use the data provided to you.\nIf user is persisting with his/her request which can't be fulfilled, apologise and repeat the policy.\nOrder Details: {details}\nPossible Intent: {intent}\nPossible Intent Resolution: {sop}. There is one function 'escalate_to_senior'. Only use this function when told in Possible Intent Resolution. Do not use this function until and unless instructed in Possible Intent Resolution. If the customer is using a language with complex grammar & words, and you are unable to detect user intent at all after trying, you need to inform user that you are 'escalating to senior' for further resolution and in that case you can make use of 'escalate_to_senior' function.Strictly generate response in the language that user has used in last messages. If user's last message is in Hinglish generate in Hinglish, if user last messages is in English generate in English.Strictly generate response in less than 2 sentences, do not spit out the whole information at once. Keep it as brief as possible without saying redundant stuff. Never reapeat the same sentence twice, atleast rephrase it.Never ask any follow up unnecessary question which are not at all related to the user chat which you can't use.If you feel like we can end chat / user is satisfied now and doesn't have any other query or user is asking to close chat strictly return back 'end chat' as response and nothing else.Examples: 1){constants.EXAMPLE_GENERIC_QUERY} 2){constants.EXAMPLE_ORDER_DELIVERY_DATE}\n"
-                        ])
+from langchain.embeddings import VertexAIEmbeddings
+from langchain_google_vertexai import ChatVertexAI
+from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 
-chat = model.start_chat(response_validation=False)
+from langchain.chains.question_answering import load_qa_chain
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
-def get_chat_response(chat: ChatSession, prompt: str) -> str:
-    text_response = []
-    responses = chat.send_message(prompt, stream=True)
-    for chunk in responses:
-        text_response.append(chunk.text)
-    return "".join(text_response)
+import warnings
+warnings.filterwarnings("ignore")
 
-####### ------------------------------------------- ########
+## -------------------- Config -------------------- ##
 
-st.title("Wayfair Virtual Chat Assistant")
+embedding_method = OpenAIEmbeddings()
 
-if "gemini_model" not in st.session_state:
-    st.session_state["gemini_model"] = "gemini-1.5-pro-001"
+st.session_state["source_path"] = "/Users/pa341z/Desktop/wayfair_ds/genai_exp/GenAI_RAG_demo/policy_documents"
+st.session_state["input_format"] = "txt"
+if "llm" not in st.session_state:
+    st.session_state['llm'] = ChatOpenAI(model="gpt-3.5-turbo-0125") #ChatVertexAI(model="gemini-1.5-pro-001")
+if "store" not in st.session_state:
+    st.session_state['store'] = {}
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+## -------------------- Utils -------------------- ##
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+def get_documents(source_path, input_format='txt'):
+    if input_format=="web":
+        loader = WebBaseLoader(source_path)
+    elif input_format=="pdf":
+        loader = PyPDFLoader(source_path)
+    elif input_format=='txt':
+        loader = DirectoryLoader(source_path, glob="./*.txt", loader_cls=TextLoader)
+    else:
+        return "INVALID DATA FORMAT"
+    docs = loader.load()
+    return docs
 
-if prompt := st.chat_input("How can I help you?"):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+def get_text_chunks(docs):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, 
+        chunk_overlap=200, 
+        add_start_index=True
+        )
+    text_chunks = text_splitter.split_documents(docs)
+    return text_chunks
 
-    with st.chat_message("assistant"):
-        output = get_chat_response(chat, prompt)
-        response = st.markdown(output)
-    st.session_state.messages.append({"role": "assistant", "content": output})
+def get_vector_store(text_chunks):
+    vectorstore = Chroma.from_documents(documents=text_chunks, 
+                                        embedding=embedding_method, 
+                                        persist_directory="./new_index")
+    return vectorstore
 
-    print("###### messages: ", st.session_state.messages)
+def load_vector_store():
+    vectorstore = Chroma(persist_directory="./new_index", 
+                         embedding_function=embedding_method)
+    return vectorstore
+
+def get_retriever(vectorstore, nn=5):
+    retriever = vectorstore.as_retriever(search_type="similarity", 
+                                         search_kwargs={"k": nn})
+    return retriever
+
+def get_history_aware_retriever(llm, retriever):
+    contextualize_q_system_prompt = (
+        "Given a chat history and the latest user question "
+        "which might reference context in the chat history, "
+        "formulate a standalone question which can be understood "
+        "without the chat history. Do NOT answer the question, "
+        "just reformulate it if needed and otherwise return it as is."
+    )
+    contextualize_q_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", contextualize_q_system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+    return history_aware_retriever
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+        if session_id not in st.session_state.store:
+            st.session_state.store[session_id] = ChatMessageHistory()
+        return st.session_state.store[session_id]
+
+def get_rag_chain(llm, history_aware_retriever):
+
+    system_prompt = (
+        "You are an assistant for question-answering tasks. "
+        "Use the following pieces of retrieved context to answer "
+        "the question. If you don't know the answer, say that you "
+        "don't know. Use three sentences maximum and keep the answer concise."
+        "\n\n"
+        "{context}"
+    )
+    qa_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", system_prompt),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
+    return conversational_rag_chain
+
+def get_llm_response(conversational_rag_chain, user_query):
+    response = conversational_rag_chain.invoke(
+                    {"input": user_query}, 
+                    config={"configurable": {"session_id": "abc123"}},
+                )["answer"]
+    return response
+
+def main():
+    st.title("RAG based Chatbot Demo")
+
+    with st.spinner("Reading documents and Indexing..."):
+        if "docs" not in st.session_state:
+            st.session_state["docs"] = get_documents(st.session_state["source_path"], st.session_state["input_format"])
+        if "text_chunks" not in st.session_state:
+            st.session_state["text_chunks"] = get_text_chunks(st.session_state["docs"])
+        if "vectorstore" not in st.session_state:
+            st.session_state["vectorstore"] = get_vector_store(st.session_state["text_chunks"])
+            # st.session_state["vectorstore"] = load_vector_store()
+        if "retriever" not in st.session_state:
+            st.session_state["retriever"] = get_retriever(st.session_state["vectorstore"], nn=5)
+        if "history_aware_retriever" not in st.session_state:
+            st.session_state["history_aware_retriever"] = get_history_aware_retriever(st.session_state["llm"], st.session_state["retriever"])
+        if "conversational_rag_chain" not in st.session_state:
+            st.session_state["conversational_rag_chain"] = get_rag_chain(st.session_state["llm"], st.session_state["history_aware_retriever"])
+        st.success("Done")
+
+    if "messages" not in st.session_state:
+        st.session_state["messages"] = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if user_query := st.chat_input("Enter your question here"):
+        st.session_state.messages.append({"role": "user", "content": user_query})
+        with st.chat_message("user"):
+            st.markdown(user_query)
+
+        with st.chat_message("assistant"):
+            output = get_llm_response(st.session_state["conversational_rag_chain"], user_query)
+            response = st.markdown(output)
+        st.session_state.messages.append({"role": "assistant", "content": output})
+
+
+if __name__ == "__main__":
+    main()
